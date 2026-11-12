@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import os
 import sys
 
@@ -158,7 +159,7 @@ class PolarisEnv(IsaaclabBaseEnv):
                     self._ic_idx = (self._ic_idx + 1) % len(self.initial_conditions)
                     return obs, info
 
-                def step(self, actions):
+                def step(self, actions, auto_reset=True):
                     if not isinstance(actions, torch.Tensor):
                         actions = torch.as_tensor(actions, device=self.device)
                     else:
@@ -295,15 +296,14 @@ class PolarisEnv(IsaaclabBaseEnv):
                 t = torch.as_tensor(rubric_success, device=terminations.device)
                 terminations = t.bool().reshape_as(terminations)
 
-        step_reward = self._calc_step_reward(terminations)
+        # A copy: _calc_step_reward keeps this tensor as prev_step_reward, which the reset below zeroes.
+        step_reward = self._calc_step_reward(terminations).clone()
 
         obs = self._wrap_obs(obs)
 
         self._elapsed_steps += 1
 
         truncations = (self.elapsed_steps >= self.cfg.max_episode_steps) | truncations
-
-        dones = terminations | truncations
 
         merged_infos = {}
         if isinstance(infos, dict):
@@ -331,9 +331,10 @@ class PolarisEnv(IsaaclabBaseEnv):
             infos["episode"]["success_at_end"] = terminations
             terminations[:] = False
 
-        _auto_reset = auto_reset and self.auto_reset
-        if dones.any() and _auto_reset:
-            obs, infos = self._handle_auto_reset(dones, obs, infos)
+        # The episodes that ended in a chunk are reset in its last step.
+        self._ended |= terminations | truncations
+        if auto_reset and self.auto_reset and self._ended.any():
+            obs, infos = self._handle_auto_reset(self._ended.clone(), obs, infos)
 
         return (
             obs,
@@ -342,6 +343,19 @@ class PolarisEnv(IsaaclabBaseEnv):
             truncations,
             infos,
         )
+
+    def _handle_auto_reset(self, dones, _final_obs, infos):
+        final_obs = copy.deepcopy(_final_obs)
+        final_info = copy.deepcopy(infos)
+        # num_envs is 1, so the reset of the ended environment is the reset of all.
+        obs, infos = self.reset()
+
+        infos["final_observation"] = final_obs
+        infos["final_info"] = final_info
+        infos["_final_info"] = dones
+        infos["_final_observation"] = dones
+        infos["_elapsed_steps"] = dones
+        return obs, infos
 
     @property
     def total_num_group_envs(self):
