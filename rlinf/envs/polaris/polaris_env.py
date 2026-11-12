@@ -31,8 +31,10 @@ class PolarisEnv(IsaaclabBaseEnv):
     - Launches PolaRiS inside a subprocess via ``SubProcIsaacLabEnv``.
     - Exposes the canonical RLinf observation dict (``main_images``,
       ``wrist_images``, ``states``, ``task_descriptions``).
-    - Supports ``chunk_step``, metrics tracking, auto-reset and
-      ``ignore_terminations`` inherited from ``IsaaclabBaseEnv``.
+    - Supports ``chunk_step``, metrics tracking and ``ignore_terminations``
+      inherited from ``IsaaclabBaseEnv``.
+    - Resets its environment itself in the last step of the action chunk in
+      which the episode ended.
     """
 
     def __init__(
@@ -68,7 +70,7 @@ class PolarisEnv(IsaaclabBaseEnv):
         1. Start the Isaac Sim ``AppLauncher``.
         2. Create a ``ManagerBasedRLSplatEnv`` wrapped inside a thin
            ``InnerPolarisEnv`` adapter that translates the standard
-           ``reset(seed, env_ids)`` / ``step(actions)`` protocol used by
+           ``reset(seed)`` / ``step(actions, auto_reset)`` protocol used by
            ``SubProcIsaacLabEnv._torch_worker`` into PolaRiS-specific calls.
         3. Return ``(inner_env, sim_app)``.
         """
