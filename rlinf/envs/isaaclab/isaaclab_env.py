@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import copy
 from typing import Optional
 
 import gymnasium as gym
@@ -26,6 +25,10 @@ class IsaaclabBaseEnv(gym.Env):
     """
     Class for isaaclab in rlinf. Different from other lab enviromnent, the output of isaaclab is all tensor on
     cuda.
+
+    IsaacLab resets its environments itself: with ``auto_reset``, the last step of an action chunk resets the
+    environments whose episodes ended in the chunk. An ended environment keeps stepping until then, which does
+    not count for its episode. It needs an IsaacLab whose ``step`` takes ``auto_reset``.
     """
 
     def __init__(
@@ -59,6 +62,8 @@ class IsaaclabBaseEnv(gym.Env):
         self._elapsed_steps = torch.zeros(self.num_envs, dtype=torch.int32).to(
             self.device
         )
+        # Environments whose episodes ended since their last reset.
+        self._ended = torch.zeros(self.num_envs, dtype=bool).to(self.device)
         self.ignore_terminations = cfg.ignore_terminations
 
     def _make_env_function(self):
@@ -102,26 +107,20 @@ class IsaaclabBaseEnv(gym.Env):
         infos["episode"] = episode_info
         return infos
 
-    def reset(
-        self,
-        seed: Optional[int] = None,
-        env_ids: Optional[torch.Tensor] = None,
-    ):
-        if env_ids is None:
-            obs, _ = self.env.reset(seed=seed)
-        else:
-            obs, _ = self.env.reset(seed=seed, env_ids=env_ids)
+    def reset(self, seed: Optional[int] = None):
+        obs, _ = self.env.reset(seed=seed)
         infos = {}
         obs = self._wrap_obs(obs)
-        self._reset_metrics(env_ids)
+        self._reset_metrics()
+        self._ended[:] = False
         return obs, infos
 
     def step(self, actions=None, auto_reset=True):
-        obs, step_reward, terminations, truncations, infos = self.env.step(actions)
-
-        step_reward = step_reward.clone()
-        terminations = terminations.clone()
-        truncations = truncations.clone()
+        auto_reset = auto_reset and self.auto_reset
+        obs, step_reward, terminations, truncations, infos = self.env.step(
+            actions, auto_reset
+        )
+        final_obs = infos.pop("final_obs")
 
         obs = self._wrap_obs(obs)
 
@@ -129,18 +128,32 @@ class IsaaclabBaseEnv(gym.Env):
 
         truncations = (self.elapsed_steps >= self.cfg.max_episode_steps) | truncations
 
-        dones = terminations | truncations
+        # An episode ends once: what its environment does until its reset does not count.
+        step_reward = step_reward * ~self._ended
+        terminations = terminations & ~self._ended
+        truncations = truncations & ~self._ended
 
-        infos = self._record_metrics(
-            step_reward, terminations, {}
-        )  # return infos is useless
+        infos = self._record_metrics(step_reward, terminations, infos)
         if self.ignore_terminations:
             infos["episode"]["success_at_end"] = terminations
             terminations[:] = False
 
-        _auto_reset = auto_reset and self.auto_reset  # always False
-        if dones.any() and _auto_reset:
-            obs, infos = self._handle_auto_reset(dones, obs, infos)
+        self._ended |= terminations | truncations
+        if auto_reset and self._ended.any():
+            # IsaacLab has reset the environments whose episodes it ended: their observations are those of
+            # the new episodes. An environment that reached max_episode_steps only goes on from its state.
+            ended = self._ended.clone()
+            infos = {
+                "final_observation": obs
+                if final_obs is None
+                else self._wrap_obs(final_obs),
+                "final_info": infos,
+                "_final_info": ended,
+                "_final_observation": ended,
+                "_elapsed_steps": ended,
+            }
+            self._reset_metrics(ended)
+            self._ended[:] = False
 
         return (
             obs,
@@ -163,7 +176,7 @@ class IsaaclabBaseEnv(gym.Env):
         for i in range(chunk_size):
             actions = chunk_actions[:, i]
             extracted_obs, step_reward, terminations, truncations, infos = self.step(
-                actions, auto_reset=False
+                actions, auto_reset=i == chunk_size - 1
             )
             obs_list.append(extracted_obs)
             infos_list.append(infos)
@@ -182,12 +195,6 @@ class IsaaclabBaseEnv(gym.Env):
 
         past_terminations = raw_chunk_terminations.any(dim=1)
         past_truncations = raw_chunk_truncations.any(dim=1)
-        past_dones = torch.logical_or(past_terminations, past_truncations)
-
-        if past_dones.any() and self.auto_reset:
-            obs_list[-1], infos_list[-1] = self._handle_auto_reset(
-                past_dones, obs_list[-1], infos_list[-1]
-            )
 
         if self.auto_reset or self.ignore_terminations:
             chunk_terminations = torch.zeros_like(raw_chunk_terminations).to(
@@ -207,23 +214,6 @@ class IsaaclabBaseEnv(gym.Env):
             chunk_truncations,
             infos_list,
         )
-
-    def _handle_auto_reset(self, dones, _final_obs, infos):
-        final_obs = copy.deepcopy(_final_obs)
-        env_idx = torch.arange(0, self.num_envs).to(dones.device)
-        env_idx = env_idx[dones]
-        final_info = copy.deepcopy(infos)
-        obs, infos = self.reset(
-            env_ids=env_idx,
-        )
-
-        # gymnasium calls it final observation but it really is just o_{t+1} or the true next observation
-        infos["final_observation"] = final_obs
-        infos["final_info"] = final_info
-        infos["_final_info"] = dones
-        infos["_final_observation"] = dones
-        infos["_elapsed_steps"] = dones
-        return obs, infos
 
     def _wrap_obs(self, obs):
         raise NotImplementedError
